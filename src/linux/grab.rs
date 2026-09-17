@@ -185,7 +185,10 @@ convert_keys!(
     // KpDelete behaves like normal Delete most of the time
     KEY_DELETE, KpDelete,
     // Linux doesn't have an IntlBackslash key
-    KEY_BACKSLASH, IntlBackslash
+    KEY_BACKSLASH, IntlBackslash,
+    KEY_MUTE, VolumeMute,
+    KEY_VOLUMEDOWN, VolumeDown,
+    KEY_VOLUMEUP, VolumeUp
 );
 
 fn evdev_event_to_rdev_event(
