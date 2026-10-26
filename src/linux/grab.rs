@@ -618,8 +618,8 @@ where
                 };
 
                 while item.device.has_event_pending() {
-                    let (_, ev) = match item.device.next_event(evdev_rs::ReadFlag::NORMAL) {
-                        Ok(ev) => ev,
+                    let (status, ev) = match item.device.next_event(evdev_rs::ReadFlag::NORMAL) {
+                        Ok(res) => res,
                         Err(err) => {
                             let raw_err = err.raw_os_error().unwrap_or(0);
                             if raw_err == libc::EAGAIN
@@ -629,6 +629,7 @@ where
                                 break;
                             }
                             // Fatal device error (device disconnected, etc.)
+                            item.flush_held_keys();
                             item.ungrab();
                             let empty_event = epoll::Event::new(epoll::Events::empty(), 0);
                             let _ = epoll::ctl(epoll_fd, EPOLL_CTL_DEL, item.fd, empty_event);
@@ -640,6 +641,18 @@ where
 
                     if let Some(out_ev) = out_ev {
                         let _ = item.record_and_write(&out_ev);
+                    }
+
+                    // Resync events if kernel dropped events due to buffer saturation
+                    if status == evdev_rs::ReadStatus::Sync {
+                        while let Ok((_, sync_ev)) =
+                            item.device.next_event(evdev_rs::ReadFlag::SYNC)
+                        {
+                            let (out_ev, _) = func(sync_ev);
+                            if let Some(out_ev) = out_ev {
+                                let _ = item.record_and_write(&out_ev);
+                            }
+                        }
                     }
 
                     if grab_status == GrabStatus::Stop {
