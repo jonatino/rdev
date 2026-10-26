@@ -3,20 +3,19 @@ use crate::linux::keyboard::Keyboard;
 use crate::rdev::{Button, Event, EventType, GrabError, Key, KeyboardState};
 use epoll::ControlOptions::{EPOLL_CTL_ADD, EPOLL_CTL_DEL};
 use evdev_rs::{
-    enums::{EventCode, EV_KEY, EV_REL},
-    Device, InputEvent, UInputDevice,
+    enums::{EventCode, EV_KEY, EV_REL, EV_SYN},
+    Device, InputEvent, TimeVal, UInputDevice,
 };
 use inotify::{Inotify, WatchMask};
-use std::ffi::{OsStr, OsString};
+use std::collections::HashSet;
 use std::fs::{read_dir, File};
 use std::io;
 use std::os::unix::{
-    ffi::OsStrExt,
     fs::FileTypeExt,
-    io::{AsRawFd, IntoRawFd, RawFd},
+    io::{AsRawFd, RawFd},
 };
-use std::path::Path;
-use std::time::SystemTime;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 // TODO The x, y coordinates are currently wrong !! Is there mouse acceleration
 // to take into account ??
@@ -304,6 +303,188 @@ fn evdev_event_to_rdev_event(
 //     }
 // }
 
+/// Filter to detect physical keyboards and media keyboards.
+/// Excludes virtual devices (uinput), mice/pointing devices, audio jacks, and non-keyboard peripherals.
+fn is_keyboard(device: &Device) -> bool {
+    // 1. Must have a physical hardware address (not a virtual uinput device)
+    let phys = match device.phys() {
+        Some(p) if !p.is_empty() => p,
+        _ => return false,
+    };
+    if phys.starts_with("ALSA") {
+        return false;
+    }
+
+    // 2. Exclude mice / pointing devices:
+    // Pointers have horizontal and vertical relative motion (REL_X and REL_Y)
+    if device.has_event_code(&EventCode::EV_REL(EV_REL::REL_X))
+        && device.has_event_code(&EventCode::EV_REL(EV_REL::REL_Y))
+    {
+        return false;
+    }
+
+    // Exclude mouse click buttons (BTN_LEFT, BTN_RIGHT, BTN_MIDDLE)
+    if device.has_event_code(&EventCode::EV_KEY(EV_KEY::BTN_LEFT))
+        || device.has_event_code(&EventCode::EV_KEY(EV_KEY::BTN_RIGHT))
+        || device.has_event_code(&EventCode::EV_KEY(EV_KEY::BTN_MIDDLE))
+    {
+        return false;
+    }
+
+    // Exclude devices with "mouse", "touchpad", or non-keyboard peripherals in name
+    let name = device.name().unwrap_or_default().to_lowercase();
+    if name.contains("mouse")
+        || name.contains("touchpad")
+        || name.contains("trackball")
+        || name.contains("model d")
+        || name.contains("model o")
+        || name.contains("model i")
+        || name.contains("power button")
+        || name.contains("sleep button")
+        || name.contains("video bus")
+        || name.contains("led controller")
+        || name.contains("pc speaker")
+    {
+        return false;
+    }
+
+    // 3. Must support EV_KEY
+    if !device.has_event_type(&evdev_rs::enums::EventType::EV_KEY) {
+        return false;
+    }
+
+    // 4. Must support real keyboard keys or media volume keys
+    device.has_event_code(&EventCode::EV_KEY(EV_KEY::KEY_A))
+        || device.has_event_code(&EventCode::EV_KEY(EV_KEY::KEY_SPACE))
+        || device.has_event_code(&EventCode::EV_KEY(EV_KEY::KEY_ENTER))
+        || device.has_event_code(&EventCode::EV_KEY(EV_KEY::KEY_VOLUMEUP))
+        || device.has_event_code(&EventCode::EV_KEY(EV_KEY::KEY_VOLUMEDOWN))
+        || device.has_event_code(&EventCode::EV_KEY(EV_KEY::KEY_MUTE))
+}
+
+/// Filter for general input grabbing (keyboards or pointers), excluding virtual devices and non-inputs.
+fn is_keyboard_or_pointer(device: &Device) -> bool {
+    let phys = match device.phys() {
+        Some(p) if !p.is_empty() => p,
+        _ => return false,
+    };
+    if phys.starts_with("ALSA") {
+        return false;
+    }
+    let name = device.name().unwrap_or_default().to_lowercase();
+    if name.contains("power button")
+        || name.contains("sleep button")
+        || name.contains("video bus")
+        || name.contains("led controller")
+        || name.contains("pc speaker")
+    {
+        return false;
+    }
+    device.has_event_type(&evdev_rs::enums::EventType::EV_KEY)
+        || device.has_event_type(&evdev_rs::enums::EventType::EV_REL)
+}
+
+pub struct ManagedDevice {
+    pub device: Device,
+    pub output: UInputDevice,
+    pub fd: RawFd,
+    pub grabbed: bool,
+    pub held_keys: HashSet<EV_KEY>,
+}
+
+impl ManagedDevice {
+    #[allow(dead_code)]
+    pub fn new(file: File) -> io::Result<Self> {
+        let fd = file.as_raw_fd();
+        let device = Device::new_from_fd(file)?;
+        let output = UInputDevice::create_from_device(&device)?;
+        Ok(Self {
+            device,
+            output,
+            fd,
+            grabbed: false,
+            held_keys: HashSet::new(),
+        })
+    }
+
+    pub fn grab(&mut self) -> io::Result<()> {
+        if !self.grabbed {
+            self.device.grab(evdev_rs::GrabMode::Grab)?;
+            self.grabbed = true;
+        }
+        Ok(())
+    }
+
+    pub fn ungrab(&mut self) {
+        if self.grabbed {
+            let _ = self.device.grab(evdev_rs::GrabMode::Ungrab);
+            self.grabbed = false;
+        }
+    }
+
+    pub fn record_and_write(&mut self, event: &InputEvent) -> io::Result<()> {
+        if let EventCode::EV_KEY(ref k) = event.event_code {
+            if event.value == 1 {
+                self.held_keys.insert(k.clone());
+            } else if event.value == 0 {
+                self.held_keys.remove(k);
+            }
+        }
+        self.output.write_event(event)
+    }
+
+    pub fn flush_held_keys(&mut self) {
+        let time = TimeVal::new(0, 0);
+        for k in self.held_keys.drain() {
+            let rel_event = InputEvent::new(&time, &EventCode::EV_KEY(k), 0);
+            let syn_event =
+                InputEvent::new(&time, &EventCode::EV_SYN(EV_SYN::SYN_REPORT), 0);
+            let _ = self.output.write_event(&rel_event);
+            let _ = self.output.write_event(&syn_event);
+        }
+    }
+}
+
+impl Drop for ManagedDevice {
+    fn drop(&mut self) {
+        self.flush_held_keys();
+        self.ungrab();
+    }
+}
+
+/// Grab physical keyboard events without an X11 display or text translation.
+/// Non-key events are forwarded unchanged and Event::name is always None.
+pub fn grab_keys<T>(callback: T) -> Result<(), GrabError>
+where
+    T: Fn(Event) -> Option<Event> + 'static,
+{
+    filter_map_events(is_keyboard, |event| {
+        let key = match event.event_code {
+            EventCode::EV_KEY(ref key) => match evdev_key_to_rdev_key(key) {
+                Some(key) => key,
+                None => return (Some(event), GrabStatus::Continue),
+            },
+            _ => return (Some(event), GrabStatus::Continue),
+        };
+        let event_type = match event.value {
+            0 => EventType::KeyRelease(key),
+            1 | 2 => EventType::KeyPress(key),
+            _ => return (Some(event), GrabStatus::Continue),
+        };
+        let translated = Event {
+            time: SystemTime::now(),
+            name: None,
+            event_type,
+        };
+        if callback(translated).is_some() {
+            (Some(event), GrabStatus::Continue)
+        } else {
+            (None, GrabStatus::Continue)
+        }
+    })?;
+    Ok(())
+}
+
 pub fn grab<T>(callback: T) -> Result<(), GrabError>
 where
     T: Fn(Event) -> Option<Event> + 'static,
@@ -318,7 +499,7 @@ where
     let mut y = current_y as f64;
     let w = width as f64;
     let h = height as f64;
-    filter_map_events(|event| {
+    filter_map_events(is_keyboard_or_pointer, |event| {
         let event_type = match evdev_event_to_rdev_event(&event, &mut x, &mut y, w, h) {
             Some(rdev_event) => rdev_event,
             // If we can't convert event, simulate it
@@ -340,56 +521,127 @@ where
     Ok(())
 }
 
-pub fn filter_map_events<F>(mut func: F) -> io::Result<()>
+pub fn filter_map_events<P, F>(predicate: P, mut func: F) -> io::Result<()>
 where
+    P: Fn(&Device) -> bool,
     F: FnMut(InputEvent) -> (Option<InputEvent>, GrabStatus),
 {
-    let (epoll_fd, mut devices, output_devices) = setup_devices()?;
-    let mut inotify = setup_inotify(epoll_fd, &devices)?;
+    let (epoll_fd, mut devices) = setup_devices(&predicate)?;
+    let mut inotify = setup_inotify(epoll_fd, devices.len())?;
 
-    //grab devices
-    devices
-        .iter_mut()
-        .try_for_each(|device| device.grab(evdev_rs::GrabMode::Grab))?;
-
-    // create buffer for epoll to fill
-    let mut epoll_buffer = [epoll::Event::new(epoll::Events::empty(), 0); 4];
+    let mut epoll_buffer = [epoll::Event::new(epoll::Events::empty(), 0); 16];
     let mut inotify_buffer = vec![0_u8; 4096];
-    'event_loop: loop {
-        let num_events = epoll::wait(epoll_fd, -1, &mut epoll_buffer)?;
 
-        //map and simulate events, dealing with
+    'event_loop: loop {
+        let num_events = match epoll::wait(epoll_fd, -1, &mut epoll_buffer) {
+            Ok(n) => n,
+            Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+            Err(e) => return Err(e),
+        };
+
         'events: for event in &epoll_buffer[0..num_events] {
-            // new device file created
             if event.data == INOTIFY_DATA {
-                for event in inotify.read_events(&mut inotify_buffer)? {
-                    assert!(
-                        event.mask.contains(inotify::EventMask::CREATE),
-                        "inotify is listening for events other than file creation"
-                    );
-                    add_device_to_epoll_from_inotify_event(epoll_fd, event, &mut devices)?;
+                if let Ok(inotify_events) = inotify.read_events(&mut inotify_buffer) {
+                    for in_ev in inotify_events {
+                        if in_ev.mask.contains(inotify::EventMask::CREATE) {
+                            if let Some(name) = in_ev.name {
+                                let name_str = name.to_string_lossy();
+                                if !name_str.starts_with("event") {
+                                    continue;
+                                }
+
+                                let mut device_path = PathBuf::from(DEV_PATH);
+                                device_path.push(name);
+
+                                // Retry up to 5 times (125ms total) for udev permissions
+                                let mut file_opt = None;
+                                for _ in 0..5 {
+                                    match File::open(&device_path) {
+                                        Ok(f) => {
+                                            file_opt = Some(f);
+                                            break;
+                                        }
+                                        Err(ref e)
+                                            if e.kind() == io::ErrorKind::PermissionDenied =>
+                                        {
+                                            std::thread::sleep(Duration::from_millis(25));
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+
+                                let file = match file_opt {
+                                    Some(f) => f,
+                                    None => continue,
+                                };
+                                let fd = file.as_raw_fd();
+                                let dev = match Device::new_from_fd(file) {
+                                    Ok(d) => d,
+                                    Err(_) => continue,
+                                };
+                                if !predicate(&dev) {
+                                    continue;
+                                }
+                                let out = match UInputDevice::create_from_device(&dev) {
+                                    Ok(o) => o,
+                                    Err(_) => continue,
+                                };
+                                let mut managed = ManagedDevice {
+                                    device: dev,
+                                    output: out,
+                                    fd,
+                                    grabbed: false,
+                                    held_keys: HashSet::new(),
+                                };
+                                if managed.grab().is_err() {
+                                    continue;
+                                }
+                                let new_idx = devices.len();
+                                if new_idx as u64 >= INOTIFY_DATA {
+                                    managed.ungrab();
+                                    continue;
+                                }
+                                let ep_event = epoll::Event::new(EPOLLIN, new_idx as u64);
+                                if epoll::ctl(epoll_fd, EPOLL_CTL_ADD, fd, ep_event).is_err() {
+                                    managed.ungrab();
+                                    continue;
+                                }
+                                devices.push(managed);
+                            }
+                        }
+                    }
                 }
             } else {
-                // Input device recieved event
                 let device_idx = event.data as usize;
-                let device = devices.get(device_idx).unwrap();
-                while device.has_event_pending() {
-                    //TODO: deal with EV_SYN::SYN_DROPPED
-                    let (_, event) = match device.next_event(evdev_rs::ReadFlag::NORMAL) {
-                        Ok(event) => event,
-                        Err(_) => {
-                            let device_fd = device.fd().unwrap().into_raw_fd();
+                let Some(item) = devices.get_mut(device_idx) else {
+                    continue;
+                };
+
+                while item.device.has_event_pending() {
+                    let (_, ev) = match item.device.next_event(evdev_rs::ReadFlag::NORMAL) {
+                        Ok(ev) => ev,
+                        Err(err) => {
+                            let raw_err = err.raw_os_error().unwrap_or(0);
+                            if raw_err == libc::EAGAIN
+                                || raw_err == libc::EWOULDBLOCK
+                                || raw_err == libc::EINTR
+                            {
+                                break;
+                            }
+                            // Fatal device error (device disconnected, etc.)
+                            item.ungrab();
                             let empty_event = epoll::Event::new(epoll::Events::empty(), 0);
-                            epoll::ctl(epoll_fd, EPOLL_CTL_DEL, device_fd, empty_event)?;
+                            let _ = epoll::ctl(epoll_fd, EPOLL_CTL_DEL, item.fd, empty_event);
                             continue 'events;
                         }
                     };
-                    let (event, grab_status) = func(event);
 
-                    if let (Some(event), Some(out_device)) = (event, output_devices.get(device_idx))
-                    {
-                        out_device.write_event(&event)?;
+                    let (out_ev, grab_status) = func(ev);
+
+                    if let Some(out_ev) = out_ev {
+                        let _ = item.record_and_write(&out_ev);
                     }
+
                     if grab_status == GrabStatus::Stop {
                         break 'event_loop;
                     }
@@ -398,17 +650,15 @@ where
         }
     }
 
-    for device in devices.iter_mut() {
-        //ungrab devices, ignore errors
-        device.grab(evdev_rs::GrabMode::Ungrab).ok();
-    }
+    // Explicit drop calls drop on every ManagedDevice (flushing held keys and ungrabbing)
+    drop(devices);
+    let _ = epoll::close(epoll_fd);
 
-    epoll::close(epoll_fd)?;
     Ok(())
 }
 
 static DEV_PATH: &str = "/dev/input";
-const INOTIFY_DATA: u64 = u64::max_value();
+const INOTIFY_DATA: u64 = u64::MAX;
 const EPOLLIN: epoll::Events = epoll::Events::EPOLLIN;
 
 /// Whether to continue grabbing events or to stop
@@ -426,107 +676,125 @@ where
     T: AsRef<Path>,
 {
     let mut res = Vec::new();
-    for entry in read_dir(path)? {
-        let entry = entry?;
-        // /dev/input files are character devices
-        if !entry.file_type()?.is_char_device() {
+    let mut entries: Vec<_> = read_dir(path)?.filter_map(Result::ok).collect();
+    entries.sort_by_key(|e| e.path());
+
+    for entry in entries {
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if !file_type.is_char_device() {
             continue;
         }
 
         let path = entry.path();
-        let file_name_bytes = match path.file_name() {
-            Some(file_name) => file_name.as_bytes(),
-            None => continue, // file_name was "..", should be impossible
+        let file_name = match path.file_name() {
+            Some(name) => name.to_string_lossy(),
+            None => continue,
         };
-        // skip filenames matching "mouse.* or mice".
-        // these files don't play nice with libevdev, not sure why
-        // see: https://askubuntu.com/questions/1043832/difference-between-dev-input-mouse0-and-dev-input-mice
-        if file_name_bytes == OsStr::new("mice").as_bytes()
-            || file_name_bytes
-                .get(0..=1)
-                .map(|s| s == OsStr::new("js").as_bytes())
-                .unwrap_or(false)
-            || file_name_bytes
-                .get(0..=4)
-                .map(|s| s == OsStr::new("mouse").as_bytes())
-                .unwrap_or(false)
-        {
+
+        if !file_name.starts_with("event") {
             continue;
         }
-        res.push(File::open(path)?);
+
+        if let Ok(file) = File::open(&path) {
+            res.push(file);
+        }
     }
     Ok(res)
 }
 
-fn epoll_watch_all<'a, T>(device_files: T) -> io::Result<RawFd>
+fn setup_devices<P>(predicate: &P) -> io::Result<(RawFd, Vec<ManagedDevice>)>
 where
-    T: Iterator<Item = &'a File>,
+    P: Fn(&Device) -> bool,
 {
     let epoll_fd = epoll::create(true)?;
-    // add file descriptors to epoll
-    for (file_idx, file) in device_files.enumerate() {
-        let epoll_event = epoll::Event::new(EPOLLIN, file_idx as u64);
-        epoll::ctl(epoll_fd, EPOLL_CTL_ADD, file.as_raw_fd(), epoll_event)?;
-    }
-    Ok(epoll_fd)
-}
-
-fn inotify_devices() -> io::Result<Inotify> {
-    let mut inotify = Inotify::init()?;
-    inotify.add_watch(DEV_PATH, WatchMask::CREATE)?;
-    Ok(inotify)
-}
-
-fn add_device_to_epoll_from_inotify_event(
-    epoll_fd: RawFd,
-    event: inotify::Event<&OsStr>,
-    devices: &mut Vec<Device>,
-) -> io::Result<()> {
-    let mut device_path = OsString::from(DEV_PATH);
-    device_path.push(OsString::from("/"));
-    device_path.push(event.name.unwrap());
-    // new plug events
-    let file = File::open(device_path)?;
-    let fd = file.as_raw_fd();
-    let device = Device::new_from_fd(file)?;
-    let event = epoll::Event::new(EPOLLIN, devices.len() as u64);
-    devices.push(device);
-    epoll::ctl(epoll_fd, EPOLL_CTL_ADD, fd, event)?;
-    Ok(())
-}
-
-/// Returns tuple of epoll_fd, all devices, and uinput devices, where
-/// uinputdevices is the same length as devices, and each uinput device is
-/// a libevdev copy of its corresponding device.The epoll_fd is level-triggered
-/// on any available data in the original devices.
-fn setup_devices() -> io::Result<(RawFd, Vec<Device>, Vec<UInputDevice>)> {
+    let mut managed_devices = Vec::new();
     let device_files = get_device_files(DEV_PATH)?;
-    let epoll_fd = epoll_watch_all(device_files.iter())?;
-    let devices = device_files
-        .into_iter()
-        .map(Device::new_from_fd)
-        .collect::<io::Result<Vec<Device>>>()?;
-    let output_devices = devices
-        .iter()
-        .map(UInputDevice::create_from_device)
-        .collect::<io::Result<Vec<UInputDevice>>>()?;
-    Ok((epoll_fd, devices, output_devices))
+
+    for file in device_files {
+        let fd = file.as_raw_fd();
+        let device = match Device::new_from_fd(file) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        if !predicate(&device) {
+            continue;
+        }
+
+        let output = match UInputDevice::create_from_device(&device) {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+
+        let mut managed = ManagedDevice {
+            device,
+            output,
+            fd,
+            grabbed: false,
+            held_keys: HashSet::new(),
+        };
+
+        if managed.grab().is_err() {
+            continue;
+        }
+
+        let idx = managed_devices.len();
+        let epoll_event = epoll::Event::new(EPOLLIN, idx as u64);
+        if epoll::ctl(epoll_fd, EPOLL_CTL_ADD, fd, epoll_event).is_err() {
+            managed.ungrab();
+            continue;
+        }
+
+        managed_devices.push(managed);
+    }
+
+    Ok((epoll_fd, managed_devices))
 }
 
-/// Creates an inotify instance looking at /dev/input and adds it to an epoll instance.
-/// Ensures devices isnt too long, which would make the epoll data ambigious.
-fn setup_inotify(epoll_fd: RawFd, devices: &[Device]) -> io::Result<Inotify> {
-    //Ensure there is space for inotify at last epoll index.
-    if devices.len() as u64 >= INOTIFY_DATA {
-        eprintln!("number of devices: {}", devices.len());
+fn setup_inotify(epoll_fd: RawFd, devices_len: usize) -> io::Result<Inotify> {
+    if devices_len as u64 >= INOTIFY_DATA {
         return Err(io::Error::new(
             io::ErrorKind::Other,
             "too many device files!",
         ));
     }
-    // Set up inotify to listen for new devices being plugged in
-    let inotify = inotify_devices()?;
+    let mut inotify = Inotify::init()?;
+    inotify.add_watch(DEV_PATH, WatchMask::CREATE)?;
     let epoll_event = epoll::Event::new(EPOLLIN, INOTIFY_DATA);
     epoll::ctl(epoll_fd, EPOLL_CTL_ADD, inotify.as_raw_fd(), epoll_event)?;
     Ok(inotify)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_device_filtering() {
+        if let Ok(files) = get_device_files(DEV_PATH) {
+            for file in files {
+                if let Ok(dev) = Device::new_from_fd(file) {
+                    let name = dev.name().unwrap_or_default();
+                    let kb = is_keyboard(&dev);
+                    println!("Device '{}' is_keyboard = {}", name, kb);
+                    if kb {
+                        assert!(
+                            !name.to_lowercase().contains("mouse"),
+                            "Device '{}' was classified as a keyboard but contains 'mouse'",
+                            name
+                        );
+                        assert!(
+                            !dev.has_event_code(&EventCode::EV_REL(EV_REL::REL_X))
+                                || !dev.has_event_code(&EventCode::EV_REL(EV_REL::REL_Y)),
+                            "Device '{}' was classified as a keyboard but has REL_X and REL_Y",
+                            name
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

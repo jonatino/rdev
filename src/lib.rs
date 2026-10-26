@@ -364,6 +364,9 @@ where
     _grab(callback)
 }
 
+#[cfg(all(target_os = "linux", feature = "unstable_grab"))]
+pub use crate::linux::grab_keys;
+
 #[cfg(test)]
 mod tests {
     use super::*;
